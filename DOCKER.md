@@ -50,6 +50,62 @@ docker run --rm -i \
 }
 ```
 
+## Codex `config.toml` example
+
+```toml
+[mcp_servers.azure_devops]
+command = "docker"
+args = [
+  "run", "--rm", "-i",
+  "-e", "ADO_MCP_AUTH_TOKEN=YOURS_PAT",
+  "thunderquack/ado-mcp:latest",
+  "contoso",
+  "--authentication", "envvar",
+  "-d", "core",
+  "-d", "work",
+  "-d", "work-items",
+  "-d", "search",
+  "-d", "repositories",
+  "-d", "pipelines"
+]
+```
+
+## Environment variable alternative
+
+Instead of storing the PAT directly in `config.toml`, you can set `ADO_MCP_AUTH_TOKEN` in the host environment and pass it through to Docker.
+
+### Bash
+
+```bash
+export ADO_MCP_AUTH_TOKEN="your-pat-here"
+```
+
+### PowerShell
+
+```powershell
+$env:ADO_MCP_AUTH_TOKEN="your-pat-here"
+```
+
+Then use this alternative `config.toml` form:
+
+```toml
+[mcp_servers.azure_devops]
+command = "docker"
+args = [
+  "run", "--rm", "-i",
+  "-e", "ADO_MCP_AUTH_TOKEN",
+  "thunderquack/ado-mcp:latest",
+  "contoso",
+  "--authentication", "envvar",
+  "-d", "core",
+  "-d", "work",
+  "-d", "work-items",
+  "-d", "search",
+  "-d", "repositories",
+  "-d", "pipelines"
+]
+```
+
 ## Notes
 
 - Use PAT with minimal required scopes.
