@@ -1,6 +1,6 @@
-FROM node:22-alpine
+FROM node:24-alpine
 
-ARG MCP_VERSION=2.5.0
+ARG MCP_VERSION=2.9.0
 
 RUN npm config set update-notifier false \
     && npm install -g "@azure-devops/mcp@${MCP_VERSION}" \
