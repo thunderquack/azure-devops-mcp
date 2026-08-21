@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 import { AlertType, AlertValidityStatus, Confidence, Severity, State } from "azure-devops-node-api/interfaces/AlertInterfaces";
-import { createEnumMapping, encodeFormattedValue, getEnumKeys, mapStringArrayToEnum, mapStringToEnum, safeEnumConvert } from "../../src/utils";
+import { createEnumMapping, encodeFormattedValue, extractAdoStreamError, getEnumKeys, getOrgFromUrl, mapStringArrayToEnum, mapStringToEnum, safeEnumConvert } from "../../src/utils";
 
 describe("utils", () => {
   describe("createEnumMapping", () => {
@@ -432,6 +432,61 @@ describe("utils", () => {
   });
 });
 
+describe("extractAdoStreamError", () => {
+  const ADO_ERROR_JSON = JSON.stringify({
+    $id: "1",
+    innerException: null,
+    message: "Page '/nonexistent' does not exist in wiki 'my-wiki'",
+    typeName: "Microsoft.TeamFoundation.Wiki.Server.WikiPageNotFoundException, Microsoft.TeamFoundation.Wiki.Server",
+    typeKey: "WikiPageNotFoundException",
+    errorCode: 0,
+    eventId: 3000,
+  });
+
+  it("returns the message from a valid ADO error JSON string", () => {
+    expect(extractAdoStreamError(ADO_ERROR_JSON)).toBe("Page '/nonexistent' does not exist in wiki 'my-wiki'");
+  });
+
+  it("returns null for normal (non-error) content", () => {
+    expect(extractAdoStreamError("# Hello World\nSome markdown content")).toBeNull();
+  });
+
+  it("returns null for a non-JSON string", () => {
+    expect(extractAdoStreamError("plain text content")).toBeNull();
+  });
+
+  it("returns null for an empty string", () => {
+    expect(extractAdoStreamError("")).toBeNull();
+  });
+
+  it("returns null for JSON that lacks typeName", () => {
+    const json = JSON.stringify({ message: "Something went wrong" });
+    expect(extractAdoStreamError(json)).toBeNull();
+  });
+
+  it("returns null for JSON that lacks message", () => {
+    const json = JSON.stringify({
+      typeName: "Microsoft.SomeException",
+      errorCode: 0,
+    });
+    expect(extractAdoStreamError(json)).toBeNull();
+  });
+
+  it("returns null for JSON where typeName is not a string", () => {
+    const json = JSON.stringify({ typeName: 42, message: "oops" });
+    expect(extractAdoStreamError(json)).toBeNull();
+  });
+
+  it("returns null for JSON where message is not a string", () => {
+    const json = JSON.stringify({ typeName: "SomeException", message: { nested: true } });
+    expect(extractAdoStreamError(json)).toBeNull();
+  });
+
+  it("handles whitespace around the JSON string", () => {
+    expect(extractAdoStreamError(`  ${ADO_ERROR_JSON}  `)).toBe("Page '/nonexistent' does not exist in wiki 'my-wiki'");
+  });
+});
+
 describe("encodeFormattedValue", () => {
   describe("basic encoding behavior (always encode in Markdown)", () => {
     it("encodes angle brackets and dollar signs", () => {
@@ -466,5 +521,37 @@ describe("encodeFormattedValue", () => {
       expect(once).toBe("Already &lt;tag&gt; plus &lt;new&gt; and $cash");
       expect(twice).toBe(once);
     });
+  });
+});
+
+describe("getOrgFromUrl", () => {
+  it("extracts org from a dev.azure.com URL as the first path segment", () => {
+    expect(getOrgFromUrl("https://dev.azure.com/contoso")).toBe("contoso");
+    expect(getOrgFromUrl("https://dev.azure.com/contoso/project/_wiki/wikis/myWiki?pagePath=%2FHome")).toBe("contoso");
+  });
+
+  it("extracts org from a legacy visualstudio.com URL as the host subdomain", () => {
+    expect(getOrgFromUrl("https://contoso.visualstudio.com/project/_wiki/wikis/myWiki")).toBe("contoso");
+  });
+
+  it("lowercases the org for case-insensitive comparison", () => {
+    expect(getOrgFromUrl("https://dev.azure.com/Contoso/project")).toBe("contoso");
+    expect(getOrgFromUrl("https://Contoso.visualstudio.com/project")).toBe("contoso");
+  });
+
+  it("returns null for invalid URLs", () => {
+    expect(getOrgFromUrl("not-a-url")).toBeNull();
+    expect(getOrgFromUrl("")).toBeNull();
+  });
+
+  it("returns null for non-Azure DevOps hosts", () => {
+    expect(getOrgFromUrl("https://example.com/contoso/project/_wiki/wikis/myWiki")).toBeNull();
+    expect(getOrgFromUrl("https://dev.azure.com.evil.com/contoso/project")).toBeNull();
+    expect(getOrgFromUrl("https://notvisualstudio.com/contoso")).toBeNull();
+  });
+
+  it("returns null when no org segment is present", () => {
+    expect(getOrgFromUrl("https://dev.azure.com/")).toBeNull();
+    expect(getOrgFromUrl("https://dev.azure.com")).toBeNull();
   });
 });

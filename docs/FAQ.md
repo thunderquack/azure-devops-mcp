@@ -16,7 +16,7 @@ Currently, you need to fetch the list of projects so the LLM has context about t
 
 ## Are PAT's supported?
 
-Sorry, PAT's are currently not supported in this local MCP Sever.
+Yes. Personal Access Tokens (PATs) are supported through the `pat` authentication type. See [Authentication](./GETTINGSTARTED.md#authentication) for setup instructions, including the required base64 encoding format.
 
 ## Is there a remote supported version of the MCP Server?
 
@@ -28,6 +28,6 @@ Unfortunately, personal accounts are not supported. To maintain a higher level o
 
 ![image of login error for personal accounts](./media/personal-accounts-error.png)
 
-## When will a remote Azure DevOps MCP Server be availble?
+## When will a remote Azure DevOps MCP Server be available?
 
 We receive this question frequently. The good news is that work is currently underway. Development began in early January 2026. Once we can provide a reliable timeline, we will publish it on the public [Azure DevOps roadmap](https://learn.microsoft.com/en-us/azure/devops/release-notes/features-timeline).
