@@ -7,14 +7,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { getBearerHandler, getPersonalAccessTokenHandler, WebApi } from "azure-devops-node-api";
 import yargs from "yargs";
-import { hideBin } from "yargs/helpers";
 
-import { createAuthenticator } from "./auth.js";
+import { createAuthenticator, installPatFetchInterceptor } from "./auth.js";
 import { logger } from "./logger.js";
 import { getOrgTenant } from "./org-tenants.js";
 //import { configurePrompts } from "./prompts.js";
 import { configureAllTools } from "./tools.js";
 import { UserAgentComposer } from "./useragent.js";
+import { getCliArgs } from "./utils.js";
 import { packageVersion } from "./version.js";
 import { DomainsManager } from "./shared/domains.js";
 
@@ -25,7 +25,7 @@ function isGitHubCodespaceEnv(): boolean {
 const defaultAuthenticationType = isGitHubCodespaceEnv() ? "azcli" : "interactive";
 
 // Parse command line arguments using yargs
-const argv = yargs(hideBin(process.argv))
+const argv = yargs(getCliArgs())
   .scriptName("mcp-server-azuredevops")
   .usage("Usage: $0 <organization> [options]")
   .version(packageVersion)
@@ -110,18 +110,7 @@ async function main() {
 
   if (argv.authentication === "pat") {
     const basicValue = await authenticator();
-    // basicValue is already base64("{email}:{token}") — use it directly in the Authorization header
-    const _originalFetch = globalThis.fetch;
-    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.headers) {
-        const headers = new Headers(init.headers as HeadersInit);
-        if (headers.get("Authorization")?.startsWith("Bearer ")) {
-          headers.set("Authorization", `Basic ${basicValue}`);
-          init = { ...init, headers };
-        }
-      }
-      return _originalFetch(input, init);
-    };
+    installPatFetchInterceptor(basicValue);
     logger.debug("PAT mode: global fetch interceptor installed to rewrite Bearer -> Basic auth headers");
   }
 

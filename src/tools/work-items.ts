@@ -107,14 +107,19 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
   // --- wit_work_item ----------------------------------------------------------
   server.tool(
     WORKITEM_TOOLS.wit_work_item,
-    "Retrieve work item data for a project. Use the action parameter to specify the operation.",
+    "Retrieve work item data. Use the action parameter to specify the operation.",
     {
       action: z
         .enum(["get", "get_batch", "list_comments", "my", "list_revisions", "list_for_iteration", "get_type"])
         .describe(
           "The action to perform. Options: get (get a single work item by ID), get_batch (get multiple work items by IDs), list_comments (list comments on a work item), my (get work items relevant to the authenticated user), list_revisions (list revisions of a work item), list_for_iteration (list work items for a team iteration), get_type (get metadata for a work item type)."
         ),
-      project: z.string().optional().describe("The name or ID of the Azure DevOps project. Reuse from prior context if already known. If not provided, a project selection prompt will be shown."),
+      project: z
+        .string()
+        .optional()
+        .describe(
+          "The name or ID of the Azure DevOps project. Optional for get; when omitted, the work item is retrieved at organization scope. For other actions, a project selection prompt will be shown if omitted."
+        ),
       id: z.coerce.number().min(1).optional().describe("Work item ID. Required for: get."),
       ids: z.array(z.coerce.number().min(1)).optional().describe("Work item IDs. Required for: get_batch."),
       workItemId: z.coerce.number().min(1).optional().describe("Work item ID. Required for: list_comments, list_revisions."),
@@ -140,11 +145,6 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
 
         if (action === "get") {
           if (!id) return { content: [{ type: "text", text: "id is required for get" }], isError: true };
-          if (!resolvedProject) {
-            const result = await elicitProject(server, connection, "Select the Azure DevOps project to retrieve the work item from.");
-            if ("response" in result) return result.response;
-            resolvedProject = result.resolved;
-          }
           let effectiveExpand = expand;
           if (fields && fields.length > 0 && effectiveExpand != null) {
             effectiveExpand = "none";
@@ -517,9 +517,7 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
         const mimeType = getMimeType(fileName);
 
         if (mimeType.startsWith("text/")) {
-          return {
-            content: [{ type: "text", text: buffer.toString("utf-8") }],
-          };
+          return createExternalContentResponse(buffer.toString("utf-8"), "work item attachment");
         }
 
         const base64Data = buffer.toString("base64");
@@ -574,15 +572,20 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
             op: z
               .string()
               .transform((val) => val.toLowerCase())
-              .pipe(z.enum(["add", "replace", "remove"]))
+              .pipe(z.enum(["add", "replace", "remove", "test"]))
               .default("add")
-              .describe("The operation to perform."),
-            path: z.string().describe("The field path, e.g. '/fields/System.Title'."),
-            value: z.string().describe("The new value for the field."),
+              .describe("The operation to perform. Use 'test' with path '/rev' to enforce optimistic concurrency."),
+            path: z.string().describe("The path to operate on, e.g. '/fields/System.Title' or '/rev' for a revision test."),
+            value: z
+              .union([z.string(), z.number(), z.boolean(), z.null()])
+              .optional()
+              .describe("The operation value. Required for add, replace, and test; omit for remove. For a test on '/rev', pass the numeric revision previously read."),
           })
         )
         .optional()
-        .describe("Field updates for a single work item. Required for: update."),
+        .describe(
+          'Field updates for a single work item. Required for: update. For a safe read-modify-write, prepend a test operation on "/rev" with value set to the numeric revision returned by the preceding read; Azure DevOps rejects the entire update if the current revision differs.'
+        ),
       batchUpdates: z
         .array(
           z.object({
@@ -654,6 +657,10 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
         if (action === "update") {
           if (!id) return { content: [{ type: "text", text: "id is required for update" }], isError: true };
           if (!updates || updates.length === 0) return { content: [{ type: "text", text: "updates is required for update" }], isError: true };
+          const updateWithoutValue = updates.find((update) => update.op !== "remove" && update.value === undefined);
+          if (updateWithoutValue) {
+            return { content: [{ type: "text", text: `value is required for ${updateWithoutValue.op}` }], isError: true };
+          }
 
           const workItemApi = await connection.getWorkItemTrackingApi();
           const apiUpdates = updates.map((update) => ({ ...update, op: update.op }));
@@ -799,9 +806,12 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
         return { content: [{ type: "text", text: `Unknown action: ${action}` }], isError: true };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        const statusCode = typeof error === "object" && error !== null && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : undefined;
+        const statusText = statusCode === 409 ? " Conflict" : statusCode === 412 ? " Precondition Failed" : "";
+        const updateStatus = statusCode !== undefined ? ` [HTTP ${statusCode}${statusText}]` : "";
         const msgs: Record<string, string> = {
           create: `Error creating work item: ${errorMessage}`,
-          update: `Error updating work item: ${errorMessage}`,
+          update: `Error updating work item${updateStatus}: ${errorMessage}`,
           update_batch: `Error updating work items in batch: ${errorMessage}`,
           add_child: `Error creating child work items: ${errorMessage}`,
         };

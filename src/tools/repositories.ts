@@ -27,10 +27,12 @@ import { GitRepository } from "azure-devops-node-api/interfaces/TfvcInterfaces.j
 import { WebApiTagDefinition } from "azure-devops-node-api/interfaces/CoreInterfaces.js";
 import { extractAdoStreamError, getEnumKeys, streamToString, apiVersion } from "../utils.js";
 import { orgName } from "../index.js";
+import { createExternalContentResponse } from "../shared/content-safety.js";
 
 const REPO_TOOLS = {
   repo_repository: "repo_repository",
   repo_pull_request: "repo_pull_request",
+  repo_pull_request_org: "repo_pull_request_org",
   repo_pull_request_thread: "repo_pull_request_thread",
   repo_branch: "repo_branch",
   repo_file: "repo_file",
@@ -125,6 +127,40 @@ function trimPullRequest(pr: GitPullRequest | null | undefined, includeDescripti
   };
 }
 
+function trimOrganizationPullRequest(pr: GitPullRequest) {
+  return {
+    ...trimPullRequest(pr),
+    projectId: pr.repository?.project?.id,
+    repositoryId: pr.repository?.id,
+    createdBy: {
+      id: pr.createdBy?.id,
+      displayName: pr.createdBy?.displayName,
+      uniqueName: pr.createdBy?.uniqueName,
+    },
+    reviewers: pr.reviewers?.map((reviewer) => ({
+      id: reviewer.id,
+      displayName: reviewer.displayName,
+      uniqueName: reviewer.uniqueName,
+      vote: reviewer.vote,
+      isRequired: reviewer.isRequired,
+    })),
+    webUrl: pr.remoteUrl,
+  };
+}
+
+async function getOrganizationPullRequests(connection: WebApi, identityFilter: "creatorId" | "reviewerId", identityId: string, status: number, skip: number, top: number): Promise<GitPullRequest[]> {
+  const url = new URL(`${connection.serverUrl.replace(/\/$/, "")}/_apis/git/pullrequests`);
+
+  url.searchParams.set("api-version", "7.1");
+  url.searchParams.set("$skip", String(skip));
+  url.searchParams.set("$top", String(top));
+  url.searchParams.set(`searchCriteria.${identityFilter}`, identityId);
+  url.searchParams.set("searchCriteria.status", String(status));
+
+  const response = await connection.rest.get<{ value?: GitPullRequest[] }>(url.toString(), { deserializeDates: true });
+  return response.result?.value ?? [];
+}
+
 function buildVersionDescriptor(version?: string, versionType?: string): GitVersionDescriptor | undefined {
   if (!version) return undefined;
   const versionTypeMap: Record<string, GitVersionType> = {
@@ -200,7 +236,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
   // --- repo_pull_request -----------------------------------------------------
   server.tool(
     REPO_TOOLS.repo_pull_request,
-    "Retrieve pull request data. Use the action parameter to specify the operation.",
+    "Retrieve pull request data for a specific repository or project, or retrieve one pull request by ID. For the authenticated user's active pull requests across the entire organization, use repo_pull_request_org.",
     {
       action: z
         .enum(["get", "list", "list_by_commits"])
@@ -308,7 +344,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
             }
           }
 
-          return { content: [{ type: "text", text: JSON.stringify(enhancedResponse, null, 2) }] };
+          return createExternalContentResponse(enhancedResponse, "pull request");
         }
 
         if (action === "list") {
@@ -387,6 +423,50 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
         return { content: [{ type: "text", text: `Error with pull request operation: ${errorMessage}` }], isError: true };
+      }
+    }
+  );
+
+  // --- repo_pull_request_org -------------------------------------------------
+  server.tool(
+    REPO_TOOLS.repo_pull_request_org,
+    "List active pull requests across all projects and repositories in the organization for the authenticated user. Use this tool for organization-wide requests such as 'my pull requests' or 'pull requests awaiting my review'. For a specific project, repository, or pull request ID, use repo_pull_request.",
+    {
+      is_reviewer: z
+        .boolean()
+        .default(false)
+        .describe("Set to true for active pull requests where the authenticated user is a reviewer. Set to false for active pull requests created by the authenticated user."),
+      reviewStatus: z
+        .enum(["all", "approved", "pending"])
+        .default("all")
+        .describe(
+          "Filter by the authenticated user's reviewer vote when is_reviewer is true: all includes every vote, approved includes Approved and Approved with suggestions, and pending includes only No vote."
+        ),
+      top: z.coerce.number().default(100).describe("The maximum number of active pull requests to retrieve before applying the reviewStatus filter. Defaults to 100."),
+      skip: z.coerce.number().default(0).describe("The number of active pull requests to skip before applying the reviewStatus filter. Defaults to 0."),
+    },
+    async ({ is_reviewer, reviewStatus, top, skip }) => {
+      try {
+        const currentUser = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
+        const userId = currentUser.authenticatedUser.id;
+        const identityFilter = is_reviewer ? "reviewerId" : "creatorId";
+        const connection = await connectionProvider();
+        const pullRequests = await getOrganizationPullRequests(connection, identityFilter, userId, PullRequestStatus.Active, skip, top);
+
+        const filteredPullRequests = pullRequests.filter((pullRequest) => {
+          if (!is_reviewer || reviewStatus === "all") return true;
+
+          const reviewer = pullRequest.reviewers?.find((item) => item.id === userId);
+          if (reviewStatus === "approved") return reviewer?.vote === 10 || reviewer?.vote === 5;
+          return reviewer?.vote === 0;
+        });
+
+        const trimmedPullRequests = filteredPullRequests.map((pullRequest) => trimOrganizationPullRequest(pullRequest));
+
+        return { content: [{ type: "text", text: JSON.stringify(trimmedPullRequests, null, 2) }] };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return { content: [{ type: "text", text: `Error with organization pull request operation: ${errorMessage}` }], isError: true };
       }
     }
   );
@@ -563,7 +643,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
             return { content: [{ type: "text", text: `Error getting file content for '${path}': ${streamError}` }], isError: true };
           }
 
-          return { content: [{ type: "text", text: content }] };
+          return createExternalContentResponse(content, "repository file");
         }
 
         if (action === "list_directory") {
@@ -704,7 +784,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       mergeCommitMessage: z.string().optional().describe("Commit message for autocomplete. Used for update."),
       deleteSourceBranch: z.boolean().optional().default(false).describe("Delete source branch on autocomplete. Used for update."),
       transitionWorkItems: z.boolean().optional().default(true).describe("Transition work items on autocomplete. Used for update."),
-      bypassReason: z.string().optional().describe("Reason for bypassing branch policies. Used for update."),
+      bypassPolicy: z.boolean().optional().default(false).describe("Explicitly bypass branch policies on autocomplete. Used for update and requires bypassReason when true."),
+      bypassReason: z.string().optional().describe("Reason for bypassing branch policies. Used for update only when bypassPolicy is true."),
       reviewerIds: z.array(z.string()).optional().describe("List of reviewer IDs. Required for update_reviewers."),
       reviewerAction: z.enum(["add", "remove"]).optional().describe("Whether to add or remove reviewers. Required for update_reviewers."),
       vote: z.enum(["Approved", "ApprovedWithSuggestions", "NoVote", "WaitingForAuthor", "Rejected"]).optional().describe("The vote to cast. Required for vote."),
@@ -728,6 +809,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       mergeCommitMessage,
       deleteSourceBranch,
       transitionWorkItems,
+      bypassPolicy,
       bypassReason,
       reviewerIds,
       reviewerAction,
@@ -786,18 +868,22 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
           if (autoComplete !== undefined) {
             if (autoComplete) {
+              if (bypassPolicy && !bypassReason) {
+                return { content: [{ type: "text", text: "bypassReason is required when bypassPolicy is true" }], isError: true };
+              }
+
               const data = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
               updateRequest.autoCompleteSetBy = { id: data.authenticatedUser.id };
 
               const completionOptions: GitPullRequestCompletionOptions = {
                 deleteSourceBranch: deleteSourceBranch || false,
                 transitionWorkItems: transitionWorkItems !== false,
-                bypassPolicy: !!bypassReason,
+                bypassPolicy: bypassPolicy === true,
               };
 
               if (mergeStrategy) completionOptions.mergeStrategy = GitPullRequestMergeStrategy[mergeStrategy as keyof typeof GitPullRequestMergeStrategy];
               if (mergeCommitMessage) completionOptions.mergeCommitMessage = mergeCommitMessage;
-              if (bypassReason) completionOptions.bypassReason = bypassReason;
+              if (bypassPolicy && bypassReason) completionOptions.bypassReason = bypassReason;
 
               updateRequest.completionOptions = completionOptions;
             } else {
@@ -918,22 +1004,23 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
     "Write operations for pull request comment threads. Use the action parameter to specify the operation.",
     {
       action: z
-        .enum(["create", "reply", "update_status"])
+        .enum(["create", "reply", "update", "update_status"])
         .describe(
-          "The action to perform. Options: create (create a new comment thread on a pull request), reply (reply to a comment in a thread), update_status (update the status of a comment thread)."
+          "The action to perform. Options: create (create a new comment thread on a pull request), reply (reply to a comment in a thread), update (update an existing comment), update_status (update the status of a comment thread)."
         ),
       repositoryId: z.string().describe("The ID or name of the repository. When using a name instead of a GUID, project must also be provided."),
       pullRequestId: z.coerce.number().min(1).describe("The ID of the pull request."),
       project: z.string().optional().describe("Project ID or project name. Required when repositoryId is a name instead of a GUID."),
-      threadId: z.coerce.number().min(1).optional().describe("The ID of the thread. Required for reply and update_status."),
-      content: z.string().optional().describe("The content of the comment. Required for create and reply."),
+      threadId: z.coerce.number().min(1).optional().describe("The ID of the thread. Required for reply, update, and update_status."),
+      commentId: z.coerce.number().min(1).optional().describe("The ID of the comment to update. Required for update."),
+      content: z.string().optional().describe("The content of the comment. Required for create, reply, and update."),
       status: z
         .enum(getEnumKeys(CommentThreadStatus) as [string, ...string[]])
         .optional()
         .default(CommentThreadStatus[CommentThreadStatus.Active])
         .describe("The thread status. Used for create (defaults to 'Active') and required for update_status."),
       filePath: z.string().optional().describe("The file path for the comment thread. Used for create."),
-      fullResponse: z.boolean().optional().default(false).describe("Return full JSON response. Used for reply."),
+      fullResponse: z.boolean().optional().default(false).describe("Return full JSON response. Used for reply and update."),
       rightFileStartLine: z.coerce.number().min(1).optional().describe("Start line in the right file. Used for create."),
       rightFileStartOffset: z.number().optional().describe("Start character offset in the right file. Used for create."),
       rightFileEndLine: z.number().optional().describe("End line in the right file. Used for create."),
@@ -948,6 +1035,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       pullRequestId,
       project,
       threadId,
+      commentId,
       content,
       status,
       filePath,
@@ -1046,6 +1134,22 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
           if (fullResponse) return { content: [{ type: "text", text: JSON.stringify(comment, null, 2) }] };
 
           return { content: [{ type: "text", text: `Comment successfully added to thread ${threadId}.` }] };
+        }
+
+        if (action === "update") {
+          if (!threadId) return { content: [{ type: "text", text: "threadId is required for update" }], isError: true };
+          if (!commentId) return { content: [{ type: "text", text: "commentId is required for update" }], isError: true };
+          if (!content) return { content: [{ type: "text", text: "content is required for update" }], isError: true };
+
+          const comment = await gitApi.updateComment({ content }, repositoryId, pullRequestId, threadId, commentId, project);
+
+          if (!comment) {
+            return { content: [{ type: "text", text: `Error: Failed to update comment ${commentId} in thread ${threadId}. The comment was not updated successfully.` }], isError: true };
+          }
+
+          if (fullResponse) return { content: [{ type: "text", text: JSON.stringify(comment, null, 2) }] };
+
+          return { content: [{ type: "text", text: `Comment ${commentId} successfully updated in thread ${threadId}.` }] };
         }
 
         if (action === "update_status") {
